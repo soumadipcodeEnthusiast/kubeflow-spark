@@ -118,3 +118,107 @@ def run_spark_job(
             raise Exception("RESULT_JSON not found in driver logs")
             
         with open(output_json.path, "w") as f:
+            f.write(result_json)
+            
+    finally:
+        try:
+            print(f"Cleaning up SparkApplication {name}...")
+            api.delete_namespaced_custom_object(
+                group="sparkoperator.k8s.io",
+                version="v1beta2",
+                namespace=namespace,
+                plural="sparkapplications",
+                name=name
+            )
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
+
+@component(base_image="python:3.9")
+def extract_error_rate(input_json: dsl.Input[dsl.Artifact]) -> float:
+    import json
+    with open(input_json.path, "r") as f:
+        data = json.load(f)
+    return float(data.get("overall_error_rate", 0.0))
+
+@component(base_image="python:3.9")
+def build_report(
+    input_json: dsl.Input[dsl.Artifact],
+    markdown_output: Output[Markdown],
+    metrics_output: Output[Metrics]
+):
+    import json
+    with open(input_json.path, "r") as f:
+        data = json.load(f)
+        
+    overall_error_rate = data.get("overall_error_rate", 0.0)
+    spark_elapsed_s = data.get("spark_elapsed_s", 0.0)
+    endpoint_stats = data.get("endpoint_stats", [])
+    
+    # Metrics
+    metrics_output.log_metric("overall_error_rate", overall_error_rate)
+    metrics_output.log_metric("spark_elapsed_s", spark_elapsed_s)
+    
+    # Markdown
+    md_content = f"# Spark Log Analysis Report\n\n"
+    md_content += f"**Overall Error Rate**: {overall_error_rate:.4f}\n"
+    md_content += f"**Execution Time**: {spark_elapsed_s:.2f} seconds\n\n"
+    
+    md_content += "| Endpoint | Request Count | 5xx Rate | p95 Latency (ms) |\n"
+    md_content += "|---|---|---|---|\n"
+    
+    for stat in endpoint_stats:
+        md_content += f"| {stat['endpoint']} | {stat['request_count']} | {stat['5xx_rate']:.4f} | {stat['p95_latency_ms']:.2f} |\n"
+        
+    with open(markdown_output.path, "w") as f:
+        f.write(md_content)
+
+@component(base_image="python:3.9")
+def send_alert(error_rate: float, threshold: float):
+    print(f"ALERT! The overall error rate {error_rate:.4f} has exceeded the threshold {threshold:.4f}.")
+
+@dsl.pipeline(
+    name="spark-log-pipeline",
+    description="A pipeline that runs a PySpark job and analyzes logs."
+)
+def spark_log_pipeline(
+    error_threshold: float = 0.025,
+    executor_instances: int = 2,
+    namespace: str = "kubeflow"
+):
+    import uuid
+    # Use a unique name for the spark application to avoid collisions
+    spark_job = run_spark_job(
+        name=f"log-analysis-{uuid.uuid4().hex[:6]}",
+        namespace=namespace,
+        executor_instances=executor_instances
+    )
+    
+    # Setting cache to false for the spark job so it always runs
+    spark_job.set_caching_options(False)
+    
+    error_rate_task = extract_error_rate(input_json=spark_job.outputs["output_json"])
+    
+    report_task = build_report(input_json=spark_job.outputs["output_json"])
+    
+    with dsl.If(error_rate_task.output > error_threshold):
+        send_alert(error_rate=error_rate_task.output, threshold=error_threshold)
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", type=str, help="KFP API endpoint")
+    args = parser.parse_args()
+    
+    compiler = kfp.compiler.Compiler()
+    yaml_file = "spark_log_pipeline.yaml"
+    compiler.compile(pipeline_func=spark_log_pipeline, package_path=yaml_file)
+    print(f"Pipeline compiled to {yaml_file}")
+    
+    if args.host:
+        client = kfp.Client(host=args.host)
+        run = client.create_run_from_pipeline_func(
+            spark_log_pipeline,
+            arguments={},
+            enable_caching=False
+        )
+        print(f"Pipeline run submitted: {run.url}")
