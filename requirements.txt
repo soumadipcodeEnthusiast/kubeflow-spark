@@ -1,0 +1,2 @@
+kfp==2.5.0
+kubernetes==28.1.0
